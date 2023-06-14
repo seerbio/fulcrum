@@ -1,5 +1,7 @@
+import os.path
 from typing import Callable
 
+import pandas as pd
 import pytest
 
 from pyspark.sql.functions import array, col, lit, rand as _rand
@@ -116,7 +118,54 @@ def test_create_library(request, dataset_fixture, spectra_backend):
         assert "QValue" in result.columns
 
     for col in result.columns:
-        assert not col.startswith("__"), f"Leaked internal column? {col}"
+        assert not col.startswith("_"), f"Leaked internal column? {col}"
+
+
+def test_create_library_output(psm_dataset, spectra_backend, tmp_path):
+    """
+    Test that we can build a library DataFrame from our PSM and spectrum fixtures.
+    """
+    output_loc = tmp_path / "test.tsv"
+
+    result = write_library(
+        psm_dataset,
+        spectra_backend=spectra_backend,
+        output_location=str(output_loc),
+    )
+
+    # print(result.toPandas())
+
+    # Check that the result has at least one peak per spectrum
+    assert result.count() >= psm_dataset.data.count()
+
+    # Check for expected columns
+    for col in [
+        "ModifiedPeptide",
+        "PrecursorCharge",
+        "PrecursorMz",
+        "ProductMz",
+    ]:
+        assert col in result.columns
+
+    if isinstance(psm_dataset, ConfidenceDataset):
+        assert "QValue" in result.columns
+
+    for col in result.columns:
+        assert not col.startswith("_"), f"Leaked internal column? {col}"
+
+    assert os.path.exists(output_loc), "Did not find output file!"
+
+    df = pd.read_csv(output_loc, sep="\t")
+
+    assert len(df) == result.count()
+
+    for col in [
+        "ModifiedPeptide",
+        "PrecursorCharge",
+        "PrecursorMz",
+        "ProductMz",
+    ]:
+        assert col in df.columns
 
 
 def test_filter_psms_with_confidence_dataset(confidence_dataset):
