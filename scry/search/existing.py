@@ -5,7 +5,6 @@
 import logging as _logging
 from typing import (
     Callable as _Callable,
-    Iterable as _Iterable,
     Union as _Union,
 )
 
@@ -16,7 +15,6 @@ from importlib_metadata import entry_points
 from pyspark.sql import SparkSession as _SparkSession
 
 from wheely.mammoth import PsmDataset as _PsmDataset
-from wheely.mammoth.utils import listify as _listify
 
 _logger = _logging.getLogger(__name__)
 
@@ -79,8 +77,9 @@ def get_reader(engine):
 
 def read_existing_results(
     engine: _Union[str, _Callable[..., _PsmDataset]],
-    location: _Union[str, _Iterable[str]],
+    *args,
     spark: _SparkSession = None,
+    **kwargs,
 ) -> _PsmDataset:
     """
     `read_existing_results`: read search results with `wheely-mammoth`
@@ -89,11 +88,11 @@ def read_existing_results(
     ----------
     engine: str
         The search engine format whose result format will be read.
-    location: str, [str]
-        One or more locations from which results should be read
     spark: SparkSession, optional
         The SparkSession with which to read results / create DataFrames.
         If not specified a session will be created with default settings!
+
+    All other positional or keyword arguments will be passed unchanged to the engine backend.
     """
     _engine: _Callable[..., _PsmDataset]
 
@@ -102,4 +101,4 @@ def read_existing_results(
     else:
         _engine = engine
 
-    return _engine(_listify(location), spark=spark)
+    return _engine(*args, spark=spark, **kwargs)
