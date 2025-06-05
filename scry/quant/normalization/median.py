@@ -115,7 +115,7 @@ class MedianDenseNormalizer(MedianNormalizer):
         )
 
         intensities = _fns.when(
-            _fns.count(dataset.samples).over(
+            _fns.countDistinct(dataset.samples).over(
                 _Window.partitionBy(dataset.peptides, dataset.charges)
             )
             >= density_thresh * n_samples,
