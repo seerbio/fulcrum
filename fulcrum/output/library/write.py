@@ -41,6 +41,152 @@ from fulcrum.output.util import filter_psms
 _logger = _logging.getLogger(__name__)
 
 
+#: Monoisotopic residue masses (Da), used to compute theoretical b/y fragment ions for annotation.
+_AA_RESIDUE_MASS = {
+    "G": 57.02146,
+    "A": 71.03711,
+    "S": 87.03203,
+    "P": 97.05276,
+    "V": 99.06841,
+    "T": 101.04768,
+    "C": 103.00919,
+    "L": 113.08406,
+    "I": 113.08406,
+    "N": 114.04293,
+    "D": 115.02694,
+    "Q": 128.05858,
+    "K": 128.09496,
+    "E": 129.04259,
+    "M": 131.04049,
+    "H": 137.05891,
+    "F": 147.06841,
+    "R": 156.10111,
+    "Y": 163.06333,
+    "W": 186.07931,
+    "U": 150.95364,
+    "O": 237.14773,
+}
+_PROTON = 1.007276466812
+_WATER = 18.0105646863
+
+#: Captures a residue and an optional following modification group, e.g. ``C(UniMod:4)`` or ``M[+16]``.
+_ANNOT_RESIDUE_PATTERN = _re.compile(
+    r"([A-Za-z])(?:\(([^)]*)\)|\[([^\]]*)\])?"
+)
+
+
+def _mod_delta_lookup() -> _Dict[str, float]:
+    """Map a modification name (e.g. ``UniMod:4``) to its monoisotopic delta, reusing the heuristic table."""
+    return {name: delta for name, delta in _get_mod_heuristic_tbl()}
+
+
+def _residue_masses(mod_peptide: str, mod_lookup: _Dict[str, float]) -> list:
+    """Parse a (normalized) modified-peptide string into a list of per-residue monoisotopic masses."""
+    masses = []
+    for m in _ANNOT_RESIDUE_PATTERN.finditer(mod_peptide.strip("_")):
+        aa = m.group(1).upper()
+        if aa not in _AA_RESIDUE_MASS:
+            continue
+        mass = _AA_RESIDUE_MASS[aa]
+        mod = m.group(2) or m.group(3)
+        if mod:
+            if mod in mod_lookup:
+                mass += mod_lookup[mod]
+            else:
+                try:
+                    mass += float(mod)
+                except ValueError:
+                    pass  # unknown mod; best-effort, may fail to match and be dropped
+        masses.append(mass)
+    return masses
+
+
+def _theoretical_by_ions(residue_masses: list, max_charge: int) -> list:
+    """Return ``(mz, ion_type, series_number, charge)`` for b/y ions at charges ``1..max_charge``."""
+    ions = []
+    n = len(residue_masses)
+    cumulative = 0.0
+    for i in range(n - 1):  # b ions (N-terminal)
+        cumulative += residue_masses[i]
+        for z in range(1, max_charge + 1):
+            ions.append(((cumulative + z * _PROTON) / z, "b", i + 1, z))
+    cumulative = _WATER
+    for i in range(n - 1):  # y ions (C-terminal)
+        cumulative += residue_masses[n - 1 - i]
+        for z in range(1, max_charge + 1):
+            ions.append(((cumulative + z * _PROTON) / z, "y", i + 1, z))
+    return ions
+
+
+def _annotate_fragment_ions(
+    df: "_pd.DataFrame", max_charge: int = 2, tol: float = 0.05
+) -> "_pd.DataFrame":
+    """
+    Add ``FragmentType``, ``FragmentCharge``, and ``FragmentSeriesNumber`` columns to a library frame.
+
+    For each precursor the theoretical b/y ion ladder is computed at charges ``1..max_charge`` and each
+    ``ProductMz`` is matched to its nearest theoretical ion within ``tol`` Da. Fragments that match no b/y
+    ion are dropped: they cannot be assigned a valid ion identity, and a consumer that re-derives ion
+    identities would reject them.
+
+    Why this matters: the library TSV is otherwise written with only ``ProductMz``/``LibraryIntensity`` at
+    the fragment level. A consumer re-deriving ion identities from a *charge-1-only* theoretical ladder (as
+    the Radiant engine does when it re-reads the MBR library for the second-pass search) cannot place
+    **multiply-charged fragment ions** -- which modern predictors (e.g. DIA-NN 2.x) emit in quantity -- and
+    aborts on the first one. Emitting ``FragmentCharge`` (with type/series) lets the consumer use the ion
+    identity directly instead of re-deriving it.
+    """
+    if (
+        df.empty
+        or "ModifiedPeptide" not in df.columns
+        or "ProductMz" not in df.columns
+    ):
+        return df
+
+    mod_lookup = _mod_delta_lookup()
+    product_mz = df["ProductMz"].to_numpy(dtype=float)
+    frag_type = [None] * len(df)
+    frag_charge = [0] * len(df)
+    frag_series = [-1] * len(df)
+
+    # `.indices` gives integer *positional* arrays per group, aligning with `product_mz`.
+    for peptide, positions in df.groupby(
+        "ModifiedPeptide", sort=False
+    ).indices.items():
+        ions = _theoretical_by_ions(
+            _residue_masses(str(peptide), mod_lookup), max_charge
+        )
+        if not ions:
+            continue
+        for pos in positions:
+            mz = product_mz[pos]
+            best = None
+            best_d = tol
+            for imz, itype, iseries, icharge in ions:
+                d = abs(imz - mz)
+                if d < best_d:
+                    best_d = d
+                    best = (itype, iseries, icharge)
+            if best is not None:
+                frag_type[pos], frag_series[pos], frag_charge[pos] = best
+
+    result = df.copy()
+    result["FragmentType"] = frag_type
+    result["FragmentCharge"] = frag_charge
+    result["FragmentSeriesNumber"] = frag_series
+
+    matched = result["FragmentType"].notna()
+    n_drop = int((~matched).sum())
+    if n_drop:
+        _logger.warning(
+            "Fragment annotation: dropped %d of %d fragment(s) matching no b/y ion within %.3g Da",
+            n_drop,
+            len(result),
+            tol,
+        )
+    return result.loc[matched].reset_index(drop=True)
+
+
 def write_library(
     peptides: _PsmDataset,
     proteins: _Optional[_Any] = None,
@@ -54,6 +200,9 @@ def write_library(
     use_dbfs_for_s3: _Optional[bool] = None,
     peptide_kwargs: _Optional[dict] = None,
     protein_kwargs: _Optional[dict] = None,
+    annotate_fragment_ions: bool = True,
+    fragment_annotation_max_charge: int = 2,
+    fragment_annotation_tol: float = 0.05,
     **kwargs,
 ) -> _DataFrame:
     """
@@ -100,6 +249,11 @@ def write_library(
 
     Additional columns that will be written conditionally:
 
+    - ``FragmentType``, ``FragmentCharge``, ``FragmentSeriesNumber`` -- the b/y ion identity of each fragment,
+        written when ``annotate_fragment_ions`` is true (the default). These let a consumer that re-reads the
+        library use the ion identity directly rather than re-deriving it; without ``FragmentCharge`` in
+        particular, a consumer that re-derives a charge-1-only ladder cannot place multiply-charged fragment
+        ions. See ``annotate_fragment_ions`` below.
     - ``QValue`` -- *q*-value if the dataset is a :py:class:`wheely.mammoth.ConfidenceDataset`
     - ``IonMobility`` -- currently never written
 
@@ -151,6 +305,16 @@ def write_library(
         Other entries will be merged with ``kwargs`` and passed to the ``spectra_backend``.
     protein_kwargs : dict
         Ignored.
+    annotate_fragment_ions : bool; default = True
+        If true, add ``FragmentType``/``FragmentCharge``/``FragmentSeriesNumber`` to the written library by
+        matching each ``ProductMz`` to the theoretical b/y ion ladder (at charges up to
+        ``fragment_annotation_max_charge``). Fragments matching no b/y ion within
+        ``fragment_annotation_tol`` are dropped. Only the written file is affected; the returned DataFrame is
+        unchanged.
+    fragment_annotation_max_charge : int; default = 2
+        Highest fragment charge state considered when annotating fragment ions.
+    fragment_annotation_tol : float; default = 0.05
+        Match tolerance (Da) between a ``ProductMz`` and a theoretical b/y ion when annotating.
     kwargs :
         Any additional keyword arguments are passed to ``spectra_backend``.
 
@@ -330,6 +494,16 @@ def write_library(
 
         # Cast to avoid warning from mypy
         df: _pd.DataFrame = _cast(_pd.DataFrame, output.toPandas())
+
+        # Annotate fragment ions (FragmentType/FragmentCharge/FragmentSeriesNumber) so consumers that
+        # re-read this library do not have to re-derive ion identities -- in particular so multiply-charged
+        # fragments survive the round-trip. See _annotate_fragment_ions.
+        if annotate_fragment_ions:
+            df = _annotate_fragment_ions(
+                df,
+                max_charge=fragment_annotation_max_charge,
+                tol=fragment_annotation_tol,
+            )
 
         with _fsspec.open(location, "w") as out:
             df.to_csv(

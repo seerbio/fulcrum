@@ -17,6 +17,7 @@ from wheely.mammoth.spectra import (
 from fulcrum.output.library import write_library
 from fulcrum.output.library.write import (
     _normalize_peptides,
+    _annotate_fragment_ions,
 )
 
 from ....conftest import rand
@@ -329,3 +330,54 @@ def test_normalize_peptides_carbamid_metox(request, dataset_fixture):
         .toPandas()[norm_psms.peptide_column]
         .values,
     )
+
+
+def test_annotate_fragment_ions():
+    """
+    Fragment ions -- including multiply-charged ones -- are annotated with type/charge/series, and
+    fragments matching no b/y ion are dropped.
+
+    Regression test for the MBR second-pass crash: without ``FragmentCharge`` a consumer that re-derives a
+    charge-1-only ladder cannot place 2+ fragment ions. Values below are real b/y ions of HVVFGHVK from a
+    DIA-NN 2.3 predicted library; 339.180 is b6(2+) and 220.634 is y4(2+).
+    """
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "ModifiedPeptide": ["HVVFGHVK"] * 6,
+            "ProductMz": [
+                336.203,
+                339.180,
+                383.240,
+                440.262,
+                220.634,
+                999.999,
+            ],
+            "LibraryIntensity": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
+        }
+    )
+
+    out = _annotate_fragment_ions(df, max_charge=2, tol=0.05)
+
+    for col in ("FragmentType", "FragmentCharge", "FragmentSeriesNumber"):
+        assert col in out.columns
+
+    ann = {
+        round(mz, 3): (t, int(c), int(s))
+        for mz, t, c, s in zip(
+            out["ProductMz"],
+            out["FragmentType"],
+            out["FragmentCharge"],
+            out["FragmentSeriesNumber"],
+        )
+    }
+    assert ann[336.203] == ("b", 1, 3)
+    assert ann[339.180] == ("b", 2, 6)  # doubly-charged b ion
+    assert ann[383.240] == ("y", 1, 3)
+    assert ann[440.262] == ("y", 1, 4)
+    assert ann[220.634] == ("y", 2, 4)  # doubly-charged y ion
+
+    # The unmatchable fragment (matches no b/y ion within tolerance) is dropped.
+    assert 999.999 not in ann
+    assert len(out) == 5
