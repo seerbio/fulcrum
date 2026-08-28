@@ -7,6 +7,7 @@ from collections.abc import (
     Mapping as _Mapping,
     Sequence as _Sequence,
 )
+from functools import reduce as _reduce
 from typing import Any as _Any
 
 import numpy as _np
@@ -14,9 +15,11 @@ import pandas as _pd
 from pyspark.sql import (
     Column as _Column,
     DataFrame as _DataFrame,
+    functions as _fns,
 )
 from pyspark.sql.types import (
     DoubleType as _DoubleType,
+    LongType as _LongType,
     StructField as _StructField,
     StructType as _StructType,
 )
@@ -39,14 +42,20 @@ def _build_directlfq_schema(
     final_group_key_columns: _Sequence[str],
     intensity_output_columns: _Sequence[str],
 ) -> _StructType:
-    fields = [
-        _StructField(
-            column_name,
-            dataset.data.schema[column_name].dataType,
-            nullable=True,
+    fields = []
+    for column_name in final_group_key_columns:
+        data_type = (
+            _LongType()
+            if column_name == "__entity_id"
+            else dataset.data.schema[column_name].dataType
         )
-        for column_name in final_group_key_columns
-    ]
+        fields.append(
+            _StructField(
+                column_name,
+                data_type,
+                nullable=True,
+            )
+        )
     fields.extend(
         _StructField(
             output_column,
@@ -88,7 +97,7 @@ def _estimate_directlfq_track(
     directlfq_log_level: int,
     entity_label: dict[str, _Any],
 ) -> _pd.DataFrame:
-    result_columns = [sample_column, intensity_output_column]
+    result_columns = ["__entity_id", sample_column, intensity_output_column]
 
     if pdf.empty:
         return _pd.DataFrame(columns=result_columns)
@@ -159,7 +168,6 @@ def _estimate_directlfq_track(
         .stack()
         .reset_index()
         .rename(columns={"level_1": sample_column, 0: intensity_output_column})
-        .drop(columns="__entity_id")
     )
 
     return protein_long[result_columns]
@@ -168,7 +176,6 @@ def _estimate_directlfq_track(
 def _estimate_directlfq_partition(
     pdf: _pd.DataFrame,
     *,
-    entity_key_columns: _Sequence[str],
     sample_column: str,
     feature_key_columns: _Sequence[str],
     intensity_column_map: _Sequence[tuple[str, str]],
@@ -177,17 +184,13 @@ def _estimate_directlfq_partition(
     output_columns = [
         output_column for _, output_column in intensity_column_map
     ]
-    result_columns = [*entity_key_columns, sample_column, *output_columns]
+    result_columns = ["__entity_id", sample_column, *output_columns]
 
     if pdf.empty:
         return _pd.DataFrame(columns=result_columns)
 
-    entity_label = {
-        column_name: pdf[column_name].iloc[0]
-        for column_name in entity_key_columns
-    }
+    entity_id = pdf["__entity_id"].iloc[0]
     prepared_pdf = pdf.assign(
-        __entity_id="entity",
         __feature_id=_make_feature_id(pdf, feature_key_columns),
     )
 
@@ -199,14 +202,14 @@ def _estimate_directlfq_partition(
             intensity_column=source_column,
             intensity_output_column=output_column,
             directlfq_log_level=directlfq_log_level,
-            entity_label=entity_label,
+            entity_label={"__entity_id": entity_id},
         )
         if track_result.empty:
             continue
         track_series.append(
-            track_result.set_index(sample_column)[output_column].rename(
+            track_result.set_index(["__entity_id", sample_column])[
                 output_column
-            )
+            ].rename(output_column)
         )
 
     if not track_series:
@@ -219,15 +222,11 @@ def _estimate_directlfq_partition(
         if output_column not in merged_tracks.columns:
             merged_tracks[output_column] = _np.nan
 
-    for column_name, value in entity_label.items():
-        merged_tracks[column_name] = value
-
     result = merged_tracks[result_columns].copy()
 
-    # Normalize returned key columns to plain Python-object dtype before
+    # Normalize returned sample values to plain Python-object dtype before
     # Spark/Arrow serializes the pandas UDF result.
-    for column_name in [*entity_key_columns, sample_column]:
-        result[column_name] = result[column_name].astype(object)
+    result[sample_column] = result[sample_column].astype(object)
 
     return result
 
@@ -325,21 +324,57 @@ def roll_up_directlfq(
 
     schema = _build_directlfq_schema(
         filtered,
-        final_group_key_columns=output_group_keys,
+        final_group_key_columns=["__entity_id", sample_column],
         intensity_output_columns=[
             output_column for _, output_column in intensity_column_map
         ],
     )
-    intensities = filtered.data.groupBy(*entity_keys).applyInPandas(
+    entity_map = (
+        filtered.data.select(*entity_keys)
+        .distinct()
+        .withColumn("__entity_id", _fns.monotonically_increasing_id())
+    )
+    data_with_aliases = filtered.data.alias("__directlfq_data")
+    entity_map_with_aliases = entity_map.alias("__directlfq_entity_map")
+    entity_join_condition = _reduce(
+        lambda left, right: left & right,
+        (
+            _fns.col(f"__directlfq_data.{column}").eqNullSafe(
+                _fns.col(f"__directlfq_entity_map.{column}")
+            )
+            for column in entity_keys
+        ),
+    )
+    directlfq_input = data_with_aliases.join(
+        entity_map_with_aliases,
+        on=entity_join_condition,
+        how="inner",
+    ).select(
+        _fns.col("__directlfq_entity_map.__entity_id").alias("__entity_id"),
+        *[
+            _fns.col(f"__directlfq_data.{column}").alias(column)
+            for column in [
+                sample_column,
+                *feature_keys,
+                *[source_column for source_column, _ in intensity_column_map],
+            ]
+        ],
+    )
+    intensities = directlfq_input.groupBy("__entity_id").applyInPandas(
         lambda pdf: _estimate_directlfq_partition(
             pdf,
-            entity_key_columns=entity_keys,
             sample_column=sample_column,
             feature_key_columns=feature_keys,
             intensity_column_map=intensity_column_map,
             directlfq_log_level=directlfq_log_level,
         ),
         schema,
+    )
+    intensities = intensities.join(
+        entity_map, on="__entity_id", how="inner"
+    ).select(
+        *output_group_keys,
+        *[output_column for _, output_column in intensity_column_map],
     )
 
     preserved = _aggregate_reduced_columns(

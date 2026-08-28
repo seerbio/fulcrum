@@ -2,6 +2,14 @@ import logging
 
 import pytest
 from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    BooleanType,
+    DoubleType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 from wheely.mammoth.dataset import PsmIntensityConfidenceDataset
 from wheely.mammoth.proteins import (
@@ -267,7 +275,7 @@ def test_roll_up_directlfq_supports_multiple_tracks_and_preserved_reductions(
     assert rows[("s2", "P1")]["protein_normalized"] > 0
 
 
-def test_roll_up_directlfq_avoids_track_join_without_preserved_columns(
+def test_roll_up_directlfq_preserves_output_contract_without_preserved_columns(
     intensity_confidence_dataset,
 ):
     pytest.importorskip("directlfq")
@@ -285,8 +293,176 @@ def test_roll_up_directlfq_avoids_track_join_without_preserved_columns(
         qvalue_threshold=0.05,
     )
 
-    optimized_plan = rolled._jdf.queryExecution().optimizedPlan().toString()
-    assert "Join" not in optimized_plan
+    assert rolled.columns == [
+        "protein_group",
+        "sample",
+        "protein_raw",
+        "protein_normalized",
+    ]
+    assert "__entity_id" not in rolled.columns
+
+
+def test_roll_up_directlfq_preserves_multi_column_entity_keys_and_schema(
+    intensity_confidence_dataset,
+):
+    pytest.importorskip("directlfq")
+
+    rolled = roll_up_directlfq(
+        intensity_confidence_dataset,
+        entity_key_columns=["protein_group", "target"],
+        sample_column="sample",
+        feature_key_columns=["peptide", "charge"],
+        intensity_columns={"raw_intensity": "protein_raw"},
+        qvalue_threshold=0.05,
+    )
+
+    assert rolled.columns == [
+        "protein_group",
+        "target",
+        "sample",
+        "protein_raw",
+    ]
+    assert "__entity_id" not in rolled.columns
+
+    rows = {
+        (row["protein_group"], row["target"], row["sample"]): row.asDict()
+        for row in rolled.collect()
+    }
+
+    assert set(rows) == {("P1", True, "s1"), ("P1", True, "s2")}
+    assert rows[("P1", True, "s1")]["protein_raw"] > 0
+    assert rows[("P1", True, "s2")]["protein_raw"] > 0
+
+
+def test_roll_up_directlfq_preserves_null_entity_key_groups(spark_session):
+    pytest.importorskip("directlfq")
+
+    dataset = PsmIntensityConfidenceDataset(
+        spark_session.createDataFrame(
+            [
+                ("s1", None, "pepA", 2, True, 0.01, 10.0),
+                ("s2", None, "pepA", 2, True, 0.01, 12.0),
+                ("s1", None, "pepB", 2, True, 0.01, 8.0),
+                ("s2", None, "pepB", 2, True, 0.01, 9.0),
+            ],
+            schema=StructType(
+                [
+                    StructField("sample", StringType(), nullable=False),
+                    StructField("protein_group", StringType(), nullable=True),
+                    StructField("peptide", StringType(), nullable=False),
+                    StructField("charge", IntegerType(), nullable=False),
+                    StructField("target", BooleanType(), nullable=False),
+                    StructField("qvalue", DoubleType(), nullable=False),
+                    StructField("raw_intensity", DoubleType(), nullable=False),
+                ]
+            ),
+        ),
+        sample_column="sample",
+        target_column="target",
+        qvalue_column="qvalue",
+        intensity_column="raw_intensity",
+        intensity_columns=["raw_intensity"],
+        score_columns=[],
+        peptide_column="peptide",
+        charge_column="charge",
+        protein_column="protein_group",
+        protein_delim=";",
+        spectrum_columns=[],
+    )
+
+    rolled = roll_up_directlfq(
+        dataset,
+        entity_key_columns=["protein_group"],
+        sample_column="sample",
+        feature_key_columns=["peptide", "charge"],
+        intensity_columns={"raw_intensity": "protein_raw"},
+        qvalue_threshold=0.05,
+    )
+
+    rows = {
+        (row["protein_group"], row["sample"]): row.asDict()
+        for row in rolled.collect()
+    }
+
+    assert set(rows) == {(None, "s1"), (None, "s2")}
+    assert rows[(None, "s1")]["protein_raw"] > 0
+    assert rows[(None, "s2")]["protein_raw"] > 0
+
+
+def test_roll_up_directlfq_handles_long_entity_strings_without_leaking_ids(
+    spark_session,
+):
+    pytest.importorskip("directlfq")
+
+    long_protein_group = ";".join(
+        f"sp|P{i:05d}|HEADER_{i}" for i in range(400)
+    )
+    dataset = PsmIntensityConfidenceDataset(
+        spark_session.createDataFrame(
+            [
+                ("s1", long_protein_group, "pepA", 2, True, 0.01, 10.0),
+                ("s2", long_protein_group, "pepA", 2, True, 0.01, 12.0),
+                ("s1", long_protein_group, "pepB", 2, True, 0.01, 8.0),
+                ("s2", long_protein_group, "pepB", 2, True, 0.01, 9.0),
+            ],
+            schema=[
+                "sample",
+                "protein_group",
+                "peptide",
+                "charge",
+                "target",
+                "qvalue",
+                "raw_intensity",
+            ],
+        ),
+        sample_column="sample",
+        target_column="target",
+        qvalue_column="qvalue",
+        intensity_column="raw_intensity",
+        intensity_columns=["raw_intensity"],
+        score_columns=[],
+        peptide_column="peptide",
+        charge_column="charge",
+        protein_column="protein_group",
+        protein_delim=";",
+        spectrum_columns=[],
+    )
+
+    rolled = roll_up_directlfq(
+        dataset,
+        entity_key_columns=["protein_group"],
+        sample_column="sample",
+        feature_key_columns=["peptide", "charge"],
+        intensity_columns={"raw_intensity": "protein_raw"},
+        preserved_column_reductions={"target": "max", "qvalue": "min"},
+        qvalue_threshold=0.05,
+    )
+
+    assert rolled.columns == [
+        "protein_group",
+        "sample",
+        "protein_raw",
+        "target",
+        "qvalue",
+    ]
+    assert "__entity_id" not in rolled.columns
+
+    rows = {
+        (row["protein_group"], row["sample"]): row.asDict()
+        for row in rolled.collect()
+    }
+
+    assert set(rows) == {
+        (long_protein_group, "s1"),
+        (long_protein_group, "s2"),
+    }
+    assert (
+        rows[(long_protein_group, "s1")]["protein_group"] == long_protein_group
+    )
+    assert rows[(long_protein_group, "s1")]["target"] is True
+    assert rows[(long_protein_group, "s1")]["qvalue"] == pytest.approx(0.01)
+    assert rows[(long_protein_group, "s1")]["protein_raw"] > 0
+    assert rows[(long_protein_group, "s2")]["protein_raw"] > 0
 
 
 def test_quantify_proteins_directlfq_uses_primary_and_additional_tracks_without_semantics(
