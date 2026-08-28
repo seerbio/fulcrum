@@ -7,6 +7,7 @@ from collections.abc import (
     Mapping as _Mapping,
     Sequence as _Sequence,
 )
+from functools import reduce as _reduce
 from typing import Any as _Any
 
 import numpy as _np
@@ -333,13 +334,31 @@ def roll_up_directlfq(
         .distinct()
         .withColumn("__entity_id", _fns.monotonically_increasing_id())
     )
-    directlfq_input = filtered.data.join(
-        entity_map, on=entity_keys, how="inner"
+    data_with_aliases = filtered.data.alias("__directlfq_data")
+    entity_map_with_aliases = entity_map.alias("__directlfq_entity_map")
+    entity_join_condition = _reduce(
+        lambda left, right: left & right,
+        (
+            _fns.col(f"__directlfq_data.{column}").eqNullSafe(
+                _fns.col(f"__directlfq_entity_map.{column}")
+            )
+            for column in entity_keys
+        ),
+    )
+    directlfq_input = data_with_aliases.join(
+        entity_map_with_aliases,
+        on=entity_join_condition,
+        how="inner",
     ).select(
-        "__entity_id",
-        sample_column,
-        *feature_keys,
-        *[source_column for source_column, _ in intensity_column_map],
+        _fns.col("__directlfq_entity_map.__entity_id").alias("__entity_id"),
+        *[
+            _fns.col(f"__directlfq_data.{column}").alias(column)
+            for column in [
+                sample_column,
+                *feature_keys,
+                *[source_column for source_column, _ in intensity_column_map],
+            ]
+        ],
     )
     intensities = directlfq_input.groupBy("__entity_id").applyInPandas(
         lambda pdf: _estimate_directlfq_partition(
