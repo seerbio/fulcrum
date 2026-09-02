@@ -333,6 +333,7 @@ def roll_up_directlfq(
         filtered.data.select(*entity_keys)
         .distinct()
         .withColumn("__entity_id", _fns.monotonically_increasing_id())
+        .cache()
     )
     data_with_aliases = filtered.data.alias("__directlfq_data")
     entity_map_with_aliases = entity_map.alias("__directlfq_entity_map")
