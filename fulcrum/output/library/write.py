@@ -225,6 +225,12 @@ def write_library(
         rt_col = norm_psms.rt_column
         peaklist_col = norm_psms.peaklist_column
 
+        ion_mobility_columns = (
+            [norm_psms.ion_mobilities.alias("IonMobility")]
+            if isinstance(norm_psms, _IonMobilityDataset)
+            else []
+        )
+
         if _logger.isEnabledFor(_logging.INFO):
             n_rows = joined_df.count()
             _logger.info("Will write %d entries to library", n_rows)
@@ -257,6 +263,16 @@ def write_library(
         rt_col = f"spectra.{spectra.rt_column}"
         peaklist_col = f"spectra.{spectra.peaklist_column}"
 
+        ion_mobility_columns = (
+            [
+                _fns.col("spectra." + spectra.ion_mobility_column).alias(
+                    "IonMobility"
+                )
+            ]
+            if isinstance(spectra, _IonMobilityDataset)
+            else []
+        )
+
         if _logger.isEnabledFor(_logging.INFO):
             n_rows = joined_df.count()
             _logger.info(
@@ -275,15 +291,7 @@ def write_library(
             _fns.col(charge_col).cast("integer").alias("PrecursorCharge"),
             _fns.col(mz_col).alias("PrecursorMz"),
             _fns.col(rt_col).alias("Tr_recalibrated"),
-            *(
-                [
-                    _fns.col("psms." + peptides.ion_mobility_column).alias(
-                        "__ion_mobility"
-                    )
-                ]
-                if isinstance(peptides, _IonMobilityDataset)
-                else []
-            ),
+            *ion_mobility_columns,
             (~_fns.col(target_col).cast("boolean")).alias("decoy"),
             # We must select this up front, it will be aliased into the correct position below
             *(
