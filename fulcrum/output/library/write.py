@@ -28,6 +28,7 @@ from wheely.mammoth import (
 )
 from wheely.mammoth.spectra import (
     SpectraDataset as _SpectraDataset,
+    IonMobilityDataset as _IonMobilityDataset,
 )
 from wheely.mammoth.spectra.parsers.registry import (
     get_backend as _get_spectra_backend,
@@ -101,7 +102,7 @@ def write_library(
     Additional columns that will be written conditionally:
 
     - ``QValue`` -- *q*-value if the dataset is a :py:class:`wheely.mammoth.ConfidenceDataset`
-    - ``IonMobility`` -- currently never written
+    - ``IonMobility`` -- ion mobility value if the dataset is a :py:class:`wheely.mammoth.spectra.IonMobilityDataset`
 
     Currently column names can not be controlled, and are the same regardless of the input dataset
     and its column names, unless noted above.
@@ -224,6 +225,12 @@ def write_library(
         rt_col = norm_psms.rt_column
         peaklist_col = norm_psms.peaklist_column
 
+        ion_mobility_columns = (
+            [norm_psms.ion_mobilities.alias("IonMobility")]
+            if isinstance(norm_psms, _IonMobilityDataset)
+            else []
+        )
+
         if _logger.isEnabledFor(_logging.INFO):
             n_rows = joined_df.count()
             _logger.info("Will write %d entries to library", n_rows)
@@ -256,6 +263,16 @@ def write_library(
         rt_col = f"spectra.{spectra.rt_column}"
         peaklist_col = f"spectra.{spectra.peaklist_column}"
 
+        ion_mobility_columns = (
+            [
+                _fns.col("spectra." + spectra.ion_mobility_column).alias(
+                    "IonMobility"
+                )
+            ]
+            if isinstance(spectra, _IonMobilityDataset)
+            else []
+        )
+
         if _logger.isEnabledFor(_logging.INFO):
             n_rows = joined_df.count()
             _logger.info(
@@ -274,6 +291,7 @@ def write_library(
             _fns.col(charge_col).cast("integer").alias("PrecursorCharge"),
             _fns.col(mz_col).alias("PrecursorMz"),
             _fns.col(rt_col).alias("Tr_recalibrated"),
+            *ion_mobility_columns,
             (~_fns.col(target_col).cast("boolean")).alias("decoy"),
             # We must select this up front, it will be aliased into the correct position below
             *(
@@ -432,9 +450,7 @@ def _get_mod_heuristic_tbl():
             MOD("Arg10", (float)10.008269, 1),
             MOD("UniMod:268", (float)6.013809, 1),
             MOD("UniMod:269", (float)10.027228, 1)
-            """.splitlines(
-                keepends=False
-            )
+            """.splitlines(keepends=False)
             if (m := _mod_heuristic_tbl_pattern.match(row))
         ]
     return _mod_heuristic_tbl
